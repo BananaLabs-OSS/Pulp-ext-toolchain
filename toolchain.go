@@ -207,14 +207,11 @@ func toolchainStatus(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrO
 	if !ok {
 		return reply(ctx, m, respPtrOut, respLenOut, statusResp{Present: false, Path: ""})
 	}
-	// Pick the entry for this os/arch to know the expected binRelPath; fall
-	// back to any entry so we can still probe the subdir on unsupported os.
+	// Only the entry for THIS os/arch has a meaningful binRelPath; on an
+	// unsupported platform no toolchain can be present, report absent.
 	entry, ok := def.entries[runtime.GOOS+"/"+runtime.GOARCH]
 	if !ok {
-		for _, e := range def.entries {
-			entry = e
-			break
-		}
+		return reply(ctx, m, respPtrOut, respLenOut, statusResp{Present: false, Path: ""})
 	}
 	rt, err := runtimeDir()
 	if err != nil {
