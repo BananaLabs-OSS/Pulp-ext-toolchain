@@ -418,8 +418,13 @@ func extractTarGz(src, dest, subdir string) error {
 				return closeErr
 			}
 		case tar.TypeSymlink, tar.TypeLink:
-			// Skip links — Go's tarball has none in the bin path we verify;
-			// avoids cross-platform symlink + traversal headaches.
+			// Skip symlinks and hardlinks. For the current toolTable (go + git),
+			// no verified binary is itself a symlink, so this is safe. If a
+			// future toolTable entry has a binRelPath that resolves through a
+			// symlink, extractTarGz would silently leave it missing and the
+			// post-extract stat check (toolchainInstall) would return failure.
+			// Adding safe symlink extraction at that point requires a traversal
+			// guard + Windows privilege check (SeCreateSymbolicLinkPrivilege).
 			continue
 		}
 	}
