@@ -41,6 +41,13 @@ import (
 )
 
 const (
+	maxArchiveDownloadBytes = int64(2 << 30)
+	maxArchiveExpandedBytes = int64(4 << 30)
+	maxArchiveFileBytes     = int64(1 << 30)
+	maxArchiveEntries       = 100_000
+)
+
+const (
 	codeOK            = 0
 	codeMemRead       = 2
 	codeDecode        = 3
@@ -66,17 +73,17 @@ type toolDef struct {
 	entries map[string]toolEntry // key "<os>/<arch>"
 }
 
-// toolTable is the pinned URL table. Pins mirror make-runtime.ps1 (Go 1.25.6,
+// toolTable is the pinned URL table. Pins mirror make-runtime.ps1 (Go 1.25.13,
 // MinGit 2.47.1). Keyed lang → {os/arch → entry}. Unknown lang/os → unsupported.
 var toolTable = map[string]toolDef{
 	"go": {
 		subdir: "go",
 		entries: map[string]toolEntry{
-			"windows/amd64": {url: "https://go.dev/dl/go1.25.6.windows-amd64.zip", binRelPath: "bin/go.exe"},
-			"linux/amd64":   {url: "https://go.dev/dl/go1.25.6.linux-amd64.tar.gz", binRelPath: "bin/go"},
-			"linux/arm64":   {url: "https://go.dev/dl/go1.25.6.linux-arm64.tar.gz", binRelPath: "bin/go"},
-			"darwin/amd64":  {url: "https://go.dev/dl/go1.25.6.darwin-amd64.tar.gz", binRelPath: "bin/go"},
-			"darwin/arm64":  {url: "https://go.dev/dl/go1.25.6.darwin-arm64.tar.gz", binRelPath: "bin/go"},
+			"windows/amd64": {url: "https://go.dev/dl/go1.25.13.windows-amd64.zip", binRelPath: "bin/go.exe"},
+			"linux/amd64":   {url: "https://go.dev/dl/go1.25.13.linux-amd64.tar.gz", binRelPath: "bin/go"},
+			"linux/arm64":   {url: "https://go.dev/dl/go1.25.13.linux-arm64.tar.gz", binRelPath: "bin/go"},
+			"darwin/amd64":  {url: "https://go.dev/dl/go1.25.13.darwin-amd64.tar.gz", binRelPath: "bin/go"},
+			"darwin/arm64":  {url: "https://go.dev/dl/go1.25.13.darwin-arm64.tar.gz", binRelPath: "bin/go"},
 		},
 	},
 	"git": {
@@ -264,7 +271,8 @@ func download(url string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	_, copyErr := io.Copy(f, resp.Body)
+	limited := io.LimitReader(resp.Body, maxArchiveDownloadBytes+1)
+	written, copyErr := io.Copy(f, limited)
 	closeErr := f.Close()
 	if copyErr != nil {
 		os.Remove(f.Name())
@@ -273,6 +281,10 @@ func download(url string) (string, error) {
 	if closeErr != nil {
 		os.Remove(f.Name())
 		return "", closeErr
+	}
+	if written > maxArchiveDownloadBytes {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("toolchain archive exceeds %d bytes", maxArchiveDownloadBytes)
 	}
 	return f.Name(), nil
 }
@@ -320,6 +332,10 @@ func extractZip(src, dest, subdir string) error {
 		return err
 	}
 	defer zr.Close()
+	if len(zr.File) > maxArchiveEntries {
+		return fmt.Errorf("toolchain archive exceeds %d entries", maxArchiveEntries)
+	}
+	var expanded int64
 	for _, zf := range zr.File {
 		rel := flatten(zf.Name, subdir)
 		if rel == "" {
@@ -330,12 +346,16 @@ func extractZip(src, dest, subdir string) error {
 			return err
 		}
 		if zf.FileInfo().IsDir() {
-			if err := os.MkdirAll(target, 0o755); err != nil {
+			if err := os.MkdirAll(target, 0o700); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		if zf.UncompressedSize64 > uint64(maxArchiveFileBytes) || zf.UncompressedSize64 > uint64(maxArchiveExpandedBytes-expanded) {
+			return fmt.Errorf("toolchain archive expansion exceeds configured limit")
+		}
+		expanded += int64(zf.UncompressedSize64) // #nosec G115 -- bounded by maxArchiveExpandedBytes.
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 			return err
 		}
 		rc, err := zf.Open()
@@ -351,11 +371,14 @@ func extractZip(src, dest, subdir string) error {
 			rc.Close()
 			return err
 		}
-		_, copyErr := io.Copy(out, rc)
+		written, copyErr := io.Copy(out, io.LimitReader(rc, maxArchiveFileBytes+1))
 		rc.Close()
 		closeErr := out.Close()
 		if copyErr != nil {
 			return copyErr
+		}
+		if written > maxArchiveFileBytes {
+			return fmt.Errorf("toolchain archive member %q exceeds configured limit", zf.Name)
 		}
 		if closeErr != nil {
 			return closeErr
@@ -376,6 +399,8 @@ func extractTarGz(src, dest, subdir string) error {
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	var expanded int64
+	entries := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -383,6 +408,10 @@ func extractTarGz(src, dest, subdir string) error {
 		}
 		if err != nil {
 			return err
+		}
+		entries++
+		if entries > maxArchiveEntries {
+			return fmt.Errorf("toolchain archive exceeds %d entries", maxArchiveEntries)
 		}
 		rel := flatten(hdr.Name, subdir)
 		if rel == "" {
@@ -394,11 +423,15 @@ func extractTarGz(src, dest, subdir string) error {
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
+			if err := os.MkdirAll(target, 0o700); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if hdr.Size < 0 || hdr.Size > maxArchiveFileBytes || hdr.Size > maxArchiveExpandedBytes-expanded {
+				return fmt.Errorf("toolchain archive expansion exceeds configured limit")
+			}
+			expanded += hdr.Size
+			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 				return err
 			}
 			mode := os.FileMode(hdr.Mode).Perm()
@@ -409,10 +442,13 @@ func extractTarGz(src, dest, subdir string) error {
 			if err != nil {
 				return err
 			}
-			_, copyErr := io.Copy(out, tr)
+			written, copyErr := io.Copy(out, io.LimitReader(tr, maxArchiveFileBytes+1))
 			closeErr := out.Close()
 			if copyErr != nil {
 				return copyErr
+			}
+			if written != hdr.Size {
+				return fmt.Errorf("toolchain archive member %q size mismatch", hdr.Name)
 			}
 			if closeErr != nil {
 				return closeErr
@@ -440,12 +476,22 @@ func writeResp(ctx context.Context, m api.Module, data []byte, respPtrOut, respL
 	if err != nil || len(res) == 0 {
 		return codeAllocFailed
 	}
-	ptr := uint32(res[0])
+	ptr, ok := wasmUint32(res[0])
+	if !ok || uint64(len(data)) > uint64(^uint32(0)) {
+		return codeMemWrite
+	}
 	if ptr == 0 || !m.Memory().Write(ptr, data) {
 		return codeMemWrite
 	}
-	if !m.Memory().WriteUint32Le(respPtrOut, ptr) || !m.Memory().WriteUint32Le(respLenOut, uint32(len(data))) {
+	if !m.Memory().WriteUint32Le(respPtrOut, ptr) || !m.Memory().WriteUint32Le(respLenOut, uint32(len(data))) { // #nosec G115 -- bounded above.
 		return codeMemWrite
 	}
 	return codeOK
+}
+
+func wasmUint32(value uint64) (uint32, bool) {
+	if value > uint64(^uint32(0)) {
+		return 0, false
+	}
+	return uint32(value), true
 }
